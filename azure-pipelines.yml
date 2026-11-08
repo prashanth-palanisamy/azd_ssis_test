@@ -2,7 +2,7 @@ trigger:
   - main
 
 pool:
-  vmImage: 'windows-2022' # Change to your self-hosted pool name if using a local VM runner
+  name: 'Azure pipelines 1' # Change to your self-hosted pool name if using a local VM runner
 
 variables:
   buildConfiguration: 'Release'
