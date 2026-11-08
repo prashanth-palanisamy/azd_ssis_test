@@ -1,0 +1,62 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'windows-2022' # Change to your self-hosted pool name if using a local VM runner
+
+variables:
+  buildConfiguration: 'Release'
+
+stages:
+  - stage: Build
+    displayName: 'Build SQL and SSIS Projects'
+    jobs:
+      - job: BuildJob
+        displayName: 'Compile Artifacts'
+        steps:
+          # 1. Build SQL Database Project (.sqlproj) to create a DACPAC
+          - task: VSBuild@2
+            inputs:
+              solution: '**/Database/*.sqlproj'
+              platform: 'Any CPU'
+              msBuildArgs: '/p:Configuration=$(buildConfiguration)'
+              clean: true
+
+          # 2. Build SSIS Project (.dtproj) to create an ISPAC
+          - task: VSBuild@2
+            inputs:
+              solution: '**/SSISPackage/*.dtproj'
+              platform: 'Incremental'
+              msBuildArgs: '/p:Configuration=$(buildConfiguration)'
+
+          # 3. Save build outputs as pipeline artifacts
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'deployment-artifacts'
+              publishLocation: 'Container'
+
+  - stage: Deploy
+    displayName: 'Deploy to Azure'
+    dependsOn: Build
+    jobs:
+      - deployment: DeployJob
+        environment: 'Development'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: 'deployment-artifacts'
+
+                # 4. Deploy DACPAC to Azure SQL Database
+                - task: AzureSqlDacpacDeployment@2
+                  inputs:
+                    azureSubscription: 'Your-Azure-Service-Connection'
+                    AuthenticationType: 'sqlServer'
+                    ServerName: 'ssis-pps-server.database.windows.net'
+                    DatabaseName: 'free-sql-db-3976874'
+                    SqlUsername: '$(SqlAdminUser)'
+                    SqlPassword: '$(SqlAdminPassword)'
+                    DacpacFile: '$(Pipeline.Workspace)/deployment-artifacts/**/*.dacpac'
+                    Action: 'Publish'
