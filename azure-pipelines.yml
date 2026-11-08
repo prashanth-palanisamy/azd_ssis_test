@@ -2,7 +2,7 @@ trigger:
   - main
 
 pool:
-  name: 'Azure pipelines 1' # Change to your self-hosted pool name if using a local VM runner
+  name: 'Azure pipelines 1'
 
 variables:
   buildConfiguration: 'Release'
@@ -12,24 +12,31 @@ stages:
     displayName: 'Build SQL and SSIS Projects'
     jobs:
       - job: BuildJob
-        displayName: 'Compile Artifacts'
+        displayName: 'Compile via MSBuild'
         steps:
-          # 1. Build SQL Database Project (.sqlproj) to create a DACPAC
-          - task: VSBuild@2
-            inputs:
-              solution: '**/Database/*.sqlproj'
-              platform: 'Any CPU'
-              msBuildArgs: '/p:Configuration=$(buildConfiguration)'
-              clean: true
+          # 1. Build SQL Database Project (.sqlproj) and SSIS Project (.dtproj) using raw MSBuild
+          - pwsh: |
+              Write-Host "Locating MSBuild..."
+              $msbuildPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
+              if (-not (Test-Path $msbuildPath)) {
+                  $msbuildPath = "C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe"
+              }
+              if (-not (Test-Path $msbuildPath)) {
+                  $msbuildPath = "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
+              }
+              
+              Write-Host "Using MSBuild at: $msbuildPath"
 
-          # 2. Build SSIS Project (.dtproj) to create an ISPAC
-          - task: VSBuild@2
-            inputs:
-              solution: '**/SSISPackage/*.dtproj'
-              platform: 'Incremental'
-              msBuildArgs: '/p:Configuration=$(buildConfiguration)'
+              # Build Database Project
+              & $msbuildPath "**/Database/*.sqlproj" /p:Configuration=$(buildConfiguration) /t:Rebuild
+              if ($LASTEXITCODE -ne 0) { throw "Database project build failed." }
 
-          # 3. Save build outputs as pipeline artifacts
+              # Build SSIS Project
+              & $msbuildPath "**/SSISPackage/*.dtproj" /p:Configuration=$(buildConfiguration)
+              if ($LASTEXITCODE -ne 0) { throw "SSIS project build failed." }
+            displayName: 'Compile Projects with MSBuild'
+
+          # 2. Save build outputs as pipeline artifacts
           - task: PublishBuildArtifacts@1
             inputs:
               PathtoPublish: '$(Build.ArtifactStagingDirectory)'
@@ -37,7 +44,7 @@ stages:
               publishLocation: 'Container'
 
   - stage: Deploy
-    displayName: 'Deploy to Azure'
+    displayName: 'Deploy to Azure SQL & SSISDB'
     dependsOn: Build
     jobs:
       - deployment: DeployJob
@@ -49,14 +56,60 @@ stages:
                 - download: current
                   artifact: 'deployment-artifacts'
 
-                # 4. Deploy DACPAC to Azure SQL Database
-                - task: AzureSqlDacpacDeployment@2
-                  inputs:
-                    azureSubscription: 'Your-Azure-Service-Connection'
-                    AuthenticationType: 'sqlServer'
-                    ServerName: 'ssis-pps-server.database.windows.net'
-                    DatabaseName: 'free-sql-db-3976874'
-                    SqlUsername: '$(SqlAdminUser)'
-                    SqlPassword: '$(SqlAdminPassword)'
-                    DacpacFile: '$(Pipeline.Workspace)/deployment-artifacts/**/*.dacpac'
-                    Action: 'Publish'
+                # 3. Deploy DACPAC using native SqlPackage.exe
+                - pwsh: |
+                    $sqlpackagePath = "C:\Program Files\Microsoft SQL Server\160\DAC\bin\sqlpackage.exe"
+                    if (-not (Test-Path $sqlpackagePath)) {
+                        $sqlpackagePath = "${env:ProgramFiles}\Microsoft SQL Server\150\DAC\bin\sqlpackage.exe"
+                    }
+
+                    Write-Host "Using SqlPackage at: $sqlpackagePath"
+                    
+                    $dacpacFile = Get-ChildItem -Path "$(Pipeline.Workspace)/deployment-artifacts" -Filter "*.dacpac" -Recurse | Select-Object -ExpandProperty FullName
+                    
+                    $server = "ssis-pps-server.database.windows.net"
+                    $database = "free-sql-db-3976874"
+                    $user = "$(SqlAdminUser)"
+                    $pass = "$(SqlAdminPassword)"
+
+                    & $sqlpackagePath /Action:Publish /SourceFile:"$dacpacFile" /TargetServerName:"$server" /TargetDatabaseName:"$database" /TargetUser:"$user" /TargetPassword:"$pass"
+                    if ($LASTEXITCODE -ne 0) { throw "Dacpac deployment failed." }
+                    Write-Host "Dacpac deployed successfully!"
+                  displayName: 'Deploy DACPAC via SqlPackage'
+                  env:
+                    SqlAdminPassword: $(SqlAdminPassword)
+
+                # 4. Deploy ISPAC to SSISDB Catalog
+                - pwsh: |
+                    Import-Module SqlServer -ErrorAction SilentlyContinue
+
+                    $ServerName = "ssis-pps-server.database.windows.net"
+                    $DatabaseName = "SSISDB"
+                    $FolderName = "EnterpriseFolder"
+                    $ProjectName = "YourSSISProjectName"
+                    $IspacPath = (Get-ChildItem -Path "$(Pipeline.Workspace)/deployment-artifacts" -Filter "*.ispac" -Recurse).FullName
+                    
+                    $Username = "$(SqlAdminUser)"
+                    $Password = "$(SqlAdminPassword)"
+
+                    [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.Management.IntegrationServices") | Out-Null
+                    
+                    $sqlConnectionString = "Data Source=tcp:$ServerName,1433;Initial Catalog=$DatabaseName;User ID=$Username;Password=$Password;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+                    $sqlConnection = New-Object System.Data.SqlClient.SqlConnection $sqlConnectionString
+                    $integrationServices = New-Object Microsoft.SqlServer.Management.IntegrationServices.IntegrationServices($sqlConnection)
+
+                    $catalog = $integrationServices.Catalogs[$DatabaseName]
+                    if (-not $catalog) { throw "SSISDB catalog not found on server $ServerName." }
+
+                    $folder = $catalog.Folders[$FolderName]
+                    if (-not $folder) {
+                        $folder = New-Object Microsoft.SqlServer.Management.IntegrationServices.CatalogFolder($catalog, $FolderName, "Deployed via Azure DevOps")
+                        $folder.Create()
+                    }
+
+                    [byte[]] $projectBinary = [System.IO.File]::ReadAllBytes($IspacPath)
+                    $folder.DeployProject($ProjectName, $projectBinary)
+                    Write-Host "SSIS project deployed successfully!"
+                  displayName: 'Deploy ISPAC to SSISDB Catalog'
+                  env:
+                    SqlAdminPassword: $(SqlAdminPassword)
